@@ -5,13 +5,15 @@ Simple resident Form 1040 helper for W-2 + brokerage 1099 inputs.
 What it does
 ------------
 - Extracts key fields from common PDF statements (W-2 and Fidelity-style 1099)
-- Maps them to the main lines on a simple resident Form 1040
+- Maps them to a simple resident Form 1040 summary
+- Builds a simplified Schedule D mapping from 1099-B summary totals
 - Produces a JSON summary and a readable markdown report
 
 What it does NOT do
 -------------------
 - File taxes for you
 - Support Form 1040-NR
+- Handle full Form 8949 logic
 - Handle complex credits, itemized deductions, business income, K-1s, rentals, etc.
 - Replace a CPA / EA / attorney
 
@@ -95,6 +97,37 @@ def first_decimal(patterns: Iterable[str], text: str) -> Optional[Decimal]:
     return None
 
 
+def decimal_from_match(raw: str) -> Decimal:
+    return money(Decimal(raw.replace(",", "")))
+
+
+def find_fidelity_1099b_summary_row(text: str, label: str) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    """
+    Extract proceeds, cost basis, and realized gain/loss from a Fidelity 1099-B summary row.
+
+    We search from the label forward and grab the first 6 decimal-like numbers:
+    proceeds, cost basis, market discount, wash sales, realized gain/loss, withholding.
+    """
+    normalized_text = text.replace("\r", "")
+    start = normalized_text.lower().find(label.lower())
+    if start == -1:
+        return None, None, None
+
+    window = normalized_text[start:start + 500]
+    numbers = re.findall(r"-?\d[\d,]*\.\d{2}", window)
+
+    if len(numbers) < 5:
+        return None, None, None
+
+    try:
+        proceeds = decimal_from_match(numbers[0])
+        cost_basis = decimal_from_match(numbers[1])
+        realized_gain_loss = decimal_from_match(numbers[4])
+        return proceeds, cost_basis, realized_gain_loss
+    except Exception:
+        return None, None, None
+
+
 # -----------------------------
 # Data models
 # -----------------------------
@@ -113,17 +146,41 @@ class W2Data:
 @dataclass
 class Brokerage1099Data:
     de_minimis_not_filed_with_irs: bool = False
+
     ordinary_dividends_1099div_box1a: Decimal = Decimal("0.00")
     qualified_dividends_1099div_box1b: Decimal = Decimal("0.00")
     tax_exempt_interest_dividends_box12: Decimal = Decimal("0.00")
-    short_term_realized_gain: Decimal = Decimal("0.00")
-    long_term_realized_gain: Decimal = Decimal("0.00")
     foreign_tax_paid_box7: Decimal = Decimal("0.00")
+    federal_withholding_1099: Decimal = Decimal("0.00")
+
+    short_term_proceeds: Decimal = Decimal("0.00")
+    short_term_cost_basis: Decimal = Decimal("0.00")
+    short_term_realized_gain: Decimal = Decimal("0.00")
+
+    long_term_proceeds: Decimal = Decimal("0.00")
+    long_term_cost_basis: Decimal = Decimal("0.00")
+    long_term_realized_gain: Decimal = Decimal("0.00")
+
     source_file: str = ""
 
     @property
     def total_capital_gain(self) -> Decimal:
         return money(self.short_term_realized_gain + self.long_term_realized_gain)
+
+
+@dataclass
+class ScheduleDResult:
+    part_i_line_1a_proceeds: str
+    part_i_line_1a_cost_basis: str
+    part_i_line_1a_gain_or_loss: str
+    part_i_line_7_net_short_term_gain_or_loss: str
+
+    part_ii_line_8a_proceeds: str
+    part_ii_line_8a_cost_basis: str
+    part_ii_line_8a_gain_or_loss: str
+    part_ii_line_15_net_long_term_gain_or_loss: str
+
+    part_iii_line_16_combined_net_gain_or_loss: str
 
 
 @dataclass
@@ -157,6 +214,7 @@ class Form1040SimpleResult:
     line_34_overpayment: int
     line_35a_refund: int
     line_37_amount_owed: int
+    schedule_d: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -228,39 +286,71 @@ def parse_fidelity_1099(pdf_path: Path) -> Brokerage1099Data:
         r"7\s+Foreign Tax Paid\s*\.*\s*([0-9,]+(?:\.\d{1,2})?)",
     ], text) or Decimal("0.00")
 
-    # Prefer summary totals when present.
-    short_term_gain = first_decimal([
-        r"Short-term transactions for which basis is reported to the IRS\s+[0-9,]+(?:\.\d{1,2})?\s+[0-9,]+(?:\.\d{1,2})?\s+[0-9,]+(?:\.\d{1,2})?\s+[0-9,]+(?:\.\d{1,2})?\s+([\-0-9,]+(?:\.\d{1,2})?)",
+    federal_withholding_1099 = first_decimal([
+        r"4\s+Federal Income Tax Withheld\s*\.*\s*([0-9,]+(?:\.\d{1,2})?)",
+        r"Federal Income Tax Withheld\s*\.*\s*([0-9,]+(?:\.\d{1,2})?)",
+    ], text) or Decimal("0.00")
+
+    short_term_proceeds, short_term_cost_basis, short_term_summary_gain = find_fidelity_1099b_summary_row(
+        text,
+        "Short-term transactions for which basis is reported to the IRS",
+    )
+
+    long_term_proceeds, long_term_cost_basis, long_term_summary_gain = find_fidelity_1099b_summary_row(
+        text,
+        "Long-term transactions for which basis is reported to the IRS",
+    )
+
+    box_a_short_term_gain = first_decimal([
         r"Box A Short-Term Realized Gain\s*([0-9,]+(?:\.\d{1,2})?)",
-    ], text) or Decimal("0.00")
+    ], text)
 
-    short_term_loss = first_decimal([
-        r"Box A Short-Term Realized Loss\s*([\-0-9,]+(?:\.\d{1,2})?)",
-    ], text) or Decimal("0.00")
+    box_a_short_term_loss = first_decimal([
+        r"Box A Short-Term Realized Loss\s*(-?[0-9,]+(?:\.\d{1,2})?)",
+    ], text)
 
-    long_term_gain = first_decimal([
-        r"Long-term transactions for which basis is reported to the IRS\s+[0-9,]+(?:\.\d{1,2})?\s+[0-9,]+(?:\.\d{1,2})?\s+[0-9,]+(?:\.\d{1,2})?\s+[0-9,]+(?:\.\d{1,2})?\s+([\-0-9,]+(?:\.\d{1,2})?)",
+    box_d_long_term_gain = first_decimal([
         r"Box D Long-Term Realized Gain\s*([0-9,]+(?:\.\d{1,2})?)",
-    ], text) or Decimal("0.00")
+    ], text)
 
-    long_term_loss = first_decimal([
-        r"Box D Long-Term Realized Loss\s*([\-0-9,]+(?:\.\d{1,2})?)",
-    ], text) or Decimal("0.00")
+    box_d_long_term_loss = first_decimal([
+        r"Box D Long-Term Realized Loss\s*(-?[0-9,]+(?:\.\d{1,2})?)",
+    ], text)
 
-    net_short = money(short_term_gain + short_term_loss)
-    net_long = money(long_term_gain + long_term_loss)
+    if short_term_summary_gain is not None:
+        net_short = short_term_summary_gain
+    elif box_a_short_term_gain is not None or box_a_short_term_loss is not None:
+        net_short = money((box_a_short_term_gain or Decimal("0.00")) + (box_a_short_term_loss or Decimal("0.00")))
+    else:
+        net_short = Decimal("0.00")
+
+    if long_term_summary_gain is not None:
+        net_long = long_term_summary_gain
+    elif box_d_long_term_gain is not None or box_d_long_term_loss is not None:
+        net_long = money((box_d_long_term_gain or Decimal("0.00")) + (box_d_long_term_loss or Decimal("0.00")))
+    else:
+        net_long = Decimal("0.00")
 
     normalized = re.sub(r"\s+", "", text.lower())
-    de_minimis = "deminimisrulesthisformisnotfiledwiththeirs" in normalized
+    de_minimis = (
+        "deminimisrulesthisformisnotfiledwiththeirs" in normalized
+        or "duetodeminimisrulesthisformisnotfiledwiththeirs" in normalized
+        or "notreportedtotheirs" in normalized
+    )
 
     return Brokerage1099Data(
         de_minimis_not_filed_with_irs=de_minimis,
         ordinary_dividends_1099div_box1a=ordinary_dividends,
         qualified_dividends_1099div_box1b=qualified_dividends,
         tax_exempt_interest_dividends_box12=tax_exempt_interest,
-        short_term_realized_gain=net_short,
-        long_term_realized_gain=net_long,
         foreign_tax_paid_box7=foreign_tax_paid,
+        federal_withholding_1099=federal_withholding_1099,
+        short_term_proceeds=short_term_proceeds or Decimal("0.00"),
+        short_term_cost_basis=short_term_cost_basis or Decimal("0.00"),
+        short_term_realized_gain=net_short,
+        long_term_proceeds=long_term_proceeds or Decimal("0.00"),
+        long_term_cost_basis=long_term_cost_basis or Decimal("0.00"),
+        long_term_realized_gain=net_long,
         source_file=pdf_path.name,
     )
 
@@ -271,40 +361,70 @@ def parse_fidelity_1099(pdf_path: Path) -> Brokerage1099Data:
 
 def build_simple_1040(profile: TaxProfile, w2s: list[W2Data], brokerage_forms: list[Brokerage1099Data]) -> Form1040SimpleResult:
     notes: list[str] = []
-    included_brokerage_forms = [b for b in brokerage_forms if not b.de_minimis_not_filed_with_irs]
-    excluded_brokerage_forms = [b for b in brokerage_forms if b.de_minimis_not_filed_with_irs]
+
+    # Include all brokerage forms in the taxpayer return mapping.
+    # "Not filed with the IRS" on a composite statement does NOT mean the amounts
+    # should be skipped from the taxpayer's own return.
+    included_brokerage_forms = brokerage_forms
+
+    flagged_brokerage_forms = [b for b in brokerage_forms if b.de_minimis_not_filed_with_irs]
+    if flagged_brokerage_forms:
+        flagged = ", ".join(b.source_file for b in flagged_brokerage_forms)
+        notes.append(
+            "Included brokerage statements even though they were marked de minimis / not filed with the IRS "
+            f"on the statement: {flagged}"
+        )
 
     if not profile.resident_return:
         notes.append("Profile marked as nonresident. This tool is only for simple resident Form 1040 flows, not 1040-NR.")
-    if excluded_brokerage_forms:
-        skipped = ", ".join(b.source_file for b in excluded_brokerage_forms)
-        notes.append(f"Skipped de minimis brokerage statements marked as not filed with the IRS: {skipped}")
 
     wages = money(sum((w.wages_box1 for w in w2s), Decimal("0.00")))
     w2_withholding = money(sum((w.federal_withheld_box2 for w in w2s), Decimal("0.00")))
+
     ordinary_dividends = money(sum((b.ordinary_dividends_1099div_box1a for b in included_brokerage_forms), Decimal("0.00")))
     qualified_dividends = money(sum((b.qualified_dividends_1099div_box1b for b in included_brokerage_forms), Decimal("0.00")))
     tax_exempt_interest = money(sum((b.tax_exempt_interest_dividends_box12 for b in included_brokerage_forms), Decimal("0.00")))
-    capital_gain = money(sum((b.total_capital_gain for b in included_brokerage_forms), Decimal("0.00")))
+    withholding_1099 = money(sum((b.federal_withholding_1099 for b in included_brokerage_forms), Decimal("0.00")))
+
+    schedule_d_short_term_proceeds = money(sum((b.short_term_proceeds for b in included_brokerage_forms), Decimal("0.00")))
+    schedule_d_short_term_cost_basis = money(sum((b.short_term_cost_basis for b in included_brokerage_forms), Decimal("0.00")))
+    schedule_d_short_term_gain = money(sum((b.short_term_realized_gain for b in included_brokerage_forms), Decimal("0.00")))
+
+    schedule_d_long_term_proceeds = money(sum((b.long_term_proceeds for b in included_brokerage_forms), Decimal("0.00")))
+    schedule_d_long_term_cost_basis = money(sum((b.long_term_cost_basis for b in included_brokerage_forms), Decimal("0.00")))
+    schedule_d_long_term_gain = money(sum((b.long_term_realized_gain for b in included_brokerage_forms), Decimal("0.00")))
+
+    capital_gain = money(schedule_d_short_term_gain + schedule_d_long_term_gain)
+
+    schedule_d = ScheduleDResult(
+        part_i_line_1a_proceeds=str(schedule_d_short_term_proceeds),
+        part_i_line_1a_cost_basis=str(schedule_d_short_term_cost_basis),
+        part_i_line_1a_gain_or_loss=str(schedule_d_short_term_gain),
+        part_i_line_7_net_short_term_gain_or_loss=str(schedule_d_short_term_gain),
+        part_ii_line_8a_proceeds=str(schedule_d_long_term_proceeds),
+        part_ii_line_8a_cost_basis=str(schedule_d_long_term_cost_basis),
+        part_ii_line_8a_gain_or_loss=str(schedule_d_long_term_gain),
+        part_ii_line_15_net_long_term_gain_or_loss=str(schedule_d_long_term_gain),
+        part_iii_line_16_combined_net_gain_or_loss=str(capital_gain),
+    )
 
     taxable_interest = Decimal("0.00")
     adjustments = Decimal("0.00")
 
+    # Tax-exempt interest goes on line 2a but is not included in taxable income.
     total_income = money(wages + taxable_interest + ordinary_dividends + capital_gain)
     agi = money(total_income - adjustments)
     total_deductions = money(profile.standard_deduction)
     taxable_income = money(max(agi - total_deductions, Decimal("0.00")))
 
-    # This intentionally stays simple. For low taxable income this usually ends up 0.
-    # Extend later with tax tables / qualified dividend worksheet.
-    tax = Decimal("0.00") if taxable_income == 0 else Decimal("0.00")
+    # Still intentionally simplified.
+    tax = Decimal("0.00")
     if taxable_income > 0:
         notes.append(
-            "Taxable income is above zero. This starter version does not compute full federal tax tables yet; extend before relying on it."
+            "Taxable income is above zero. This starter version does not compute full federal tax tables or qualified dividend worksheet logic yet."
         )
 
     total_tax = tax
-    withholding_1099 = Decimal("0.00")
     total_withholding = money(w2_withholding + withholding_1099)
     total_payments = total_withholding
 
@@ -334,6 +454,7 @@ def build_simple_1040(profile: TaxProfile, w2s: list[W2Data], brokerage_forms: l
         line_34_overpayment=irs_round(overpayment),
         line_35a_refund=irs_round(refund),
         line_37_amount_owed=irs_round(amount_owed),
+        schedule_d=asdict(schedule_d),
         notes=notes,
     )
 
@@ -348,20 +469,62 @@ def build_report(profile: TaxProfile, w2s: list[W2Data], brokerage_forms: list[B
     lines.append("")
     lines.append("## Inputs")
     lines.append("")
+
     for w in w2s:
         lines.append(f"### W-2: {w.source_file}")
         lines.append(f"- W-2 Box 1 wages: ${w.wages_box1}")
         lines.append(f"- W-2 Box 2 federal withholding: ${w.federal_withheld_box2}")
         lines.append("")
+
     for b in brokerage_forms:
         lines.append(f"### Brokerage 1099: {b.source_file}")
         lines.append(f"- 1099-DIV Box 1a ordinary dividends: ${b.ordinary_dividends_1099div_box1a}")
         lines.append(f"- 1099-DIV Box 1b qualified dividends: ${b.qualified_dividends_1099div_box1b}")
         lines.append(f"- 1099-DIV Box 12 tax-exempt interest dividends: ${b.tax_exempt_interest_dividends_box12}")
+        lines.append(f"- 1099 federal withholding: ${b.federal_withholding_1099}")
+        lines.append(f"- 1099-B short-term proceeds: ${b.short_term_proceeds}")
+        lines.append(f"- 1099-B short-term cost basis: ${b.short_term_cost_basis}")
         lines.append(f"- 1099-B net short-term gain: ${b.short_term_realized_gain}")
+        lines.append(f"- 1099-B long-term proceeds: ${b.long_term_proceeds}")
+        lines.append(f"- 1099-B long-term cost basis: ${b.long_term_cost_basis}")
         lines.append(f"- 1099-B net long-term gain: ${b.long_term_realized_gain}")
         lines.append(f"- 1099-B total capital gain: ${b.total_capital_gain}")
+        if b.de_minimis_not_filed_with_irs:
+            lines.append("- Note: statement text says de minimis / not filed with the IRS, but values are still included in taxpayer mapping")
         lines.append("")
+
+    included_brokerage_forms = brokerage_forms
+
+    short_term_proceeds = sum((b.short_term_proceeds for b in included_brokerage_forms), Decimal("0.00"))
+    short_term_basis = sum((b.short_term_cost_basis for b in included_brokerage_forms), Decimal("0.00"))
+    short_term_gain = sum((b.short_term_realized_gain for b in included_brokerage_forms), Decimal("0.00"))
+
+    long_term_proceeds = sum((b.long_term_proceeds for b in included_brokerage_forms), Decimal("0.00"))
+    long_term_basis = sum((b.long_term_cost_basis for b in included_brokerage_forms), Decimal("0.00"))
+    long_term_gain = sum((b.long_term_realized_gain for b in included_brokerage_forms), Decimal("0.00"))
+
+    net_gain = short_term_gain + long_term_gain
+
+    lines.append("## Form 8949 / Schedule D mapping (copy-ready)")
+    lines.append("")
+
+    lines.append("### Short-term (Part I - Line 1a, covered, basis reported)")
+    lines.append(f"- Proceeds: ${money(short_term_proceeds)}")
+    lines.append(f"- Cost basis: ${money(short_term_basis)}")
+    lines.append(f"- Gain: ${money(short_term_gain)}")
+    lines.append("")
+
+    lines.append("### Long-term (Part II - Line 8a, covered, basis reported)")
+    lines.append(f"- Proceeds: ${money(long_term_proceeds)}")
+    lines.append(f"- Cost basis: ${money(long_term_basis)}")
+    lines.append(f"- Gain: ${money(long_term_gain)}")
+    lines.append("")
+
+    lines.append("### Schedule D totals")
+    lines.append(f"- Line 7 (short-term gain): ${money(short_term_gain)}")
+    lines.append(f"- Line 15 (long-term gain): ${money(long_term_gain)}")
+    lines.append(f"- Line 16 (net capital gain): ${money(net_gain)}")
+    lines.append("")
 
     lines.append("## Form 1040 mapping")
     lines.append("")
@@ -371,7 +534,7 @@ def build_report(profile: TaxProfile, w2s: list[W2Data], brokerage_forms: list[B
         "Line 2b": f"Taxable interest = {result.line_2b_taxable_interest}",
         "Line 3a": f"Qualified dividends = {result.line_3a_qualified_dividends}",
         "Line 3b": f"Ordinary dividends = {result.line_3b_ordinary_dividends}",
-        "Line 7": f"Capital gain or loss = {result.line_7_capital_gain_or_loss}",
+        "Line 7": f"Capital gain or loss from Schedule D Part III Line 16 = {result.line_7_capital_gain_or_loss}",
         "Line 9": f"Total income = {result.line_9_total_income}",
         "Line 10": f"Adjustments = {result.line_10_adjustments}",
         "Line 11a": f"AGI = {result.line_11a_agi}",
@@ -400,9 +563,12 @@ def build_report(profile: TaxProfile, w2s: list[W2Data], brokerage_forms: list[B
     lines.append("")
     lines.append("## Important limits")
     lines.append("- This tool is for simple resident 1040 flows only.")
+    lines.append("- Schedule D is currently a simplified mapping based on 1099-B totals.")
+    lines.append("- Form 8949 is not implemented.")
     lines.append("- It does not support 1040-NR.")
     lines.append("- If taxable income is above zero, extend the federal tax calculation before relying on it.")
     lines.append("- Always compare output against the source forms and the final return.")
+
     return "\n".join(lines)
 
 
@@ -416,7 +582,7 @@ def main() -> None:
     parser.add_argument("--brokerage-1099", action="append", default=[], help="Path to a brokerage 1099 PDF. Can be passed multiple times.")
     parser.add_argument("--tax-year", type=int, default=2025)
     parser.add_argument("--filing-status", default="single", choices=["single"])
-    parser.add_argument("--resident-return", action="store_true", default=False, help="Mark this as a resident Form 1040 flow.")
+    parser.add_argument("--resident-return", action="store_true", default=True, help="Mark this as a resident Form 1040 flow.")
     parser.add_argument("--output-json", default="tax_summary.json")
     parser.add_argument("--output-report", default="tax_report.md")
     args = parser.parse_args()
