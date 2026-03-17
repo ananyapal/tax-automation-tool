@@ -1,10 +1,5 @@
 # Simple Tax Automation Starter
 
-## TaxTool: A Local PDF Tax Data Extractor and Mapper
-
-A lightweight Python tool to extract, understand, and map tax data from W-2 and 1099 PDFs to Form 1040.
-
-
 This is a small local Python tool that gives you a TurboTax-like first pass for a very specific case:
 
 - resident Form 1040 only
@@ -14,6 +9,10 @@ This is a small local Python tool that gives you a TurboTax-like first pass for 
 
 It reads your PDFs, extracts key values, and maps them to the main Form 1040 lines.
 
+---
+## TaxTool: A Local PDF Tax Data Extractor and Mapper
+
+A lightweight Python tool to extract, understand, and map tax data from W-2 and 1099 PDFs to Form 1040.
 ---
 
 ## What it supports
