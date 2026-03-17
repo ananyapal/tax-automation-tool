@@ -12,7 +12,7 @@ It reads your PDFs, extracts key values, and maps them to the main Form 1040 lin
 ---
 ## TaxTool: A Local PDF Tax Data Extractor and Mapper
 
-A lightweight Python tool to extract, understand, and map tax data from W-2 and 1099 PDFs to Form 1040.
+- A lightweight Python tool to extract, understand, and map tax data from W-2 and 1099 PDFs to Form 1040.
 ---
 
 ## What it supports
